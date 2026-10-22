@@ -221,27 +221,19 @@ public struct RDPVideoToolboxDecodeResult {
 }
 
 private final class RDPAVC444FrameDecoder {
-    private struct MainFrameKey: Hashable {
-        var codecID: UInt16
-        var left: UInt16
-        var top: UInt16
-        var right: UInt16
-        var bottom: UInt16
-    }
-
     private let h264Decoder = RDPH264FrameSequenceDecoder(
         outputPixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
     )
     private let frameStore = RDPAVC444FrameStore()
     private var metalDecoder: RDPAVC444MetalDecoder?
     private var didAttemptMetalDecoderCreation = false
-    private var mainImageBuffers: [MainFrameKey: CVImageBuffer] = [:]
+    private let mainImageBuffers = RDPAVC444PixelBufferStore()
 
     func reset() {
         h264Decoder.reset()
         frameStore.reset()
         metalDecoder?.reset()
-        mainImageBuffers.removeAll()
+        mainImageBuffers.reset()
     }
 
     func decodeDetailed(_ frame: RDPGraphicsFrameSnapshot) throws -> RDPVideoToolboxDecodeResult {
@@ -263,25 +255,20 @@ private final class RDPAVC444FrameDecoder {
         }
 
         let conversionStartedAt = Date()
+        let width = CVPixelBufferGetWidth(firstResult.imageBuffer)
+        let height = CVPixelBufferGetHeight(firstResult.imageBuffer)
         let chromaRegionRects: [RDPFrameRect] = switch layout {
-        case .yuv420AndChroma420:
-            sourceRegionRects(frame.auxiliaryRegionRects, destinationRect: frame.destinationRect)
-        case .chroma420Only:
-            sourceRegionRects(frame.regionRects, destinationRect: frame.destinationRect)
-        case .yuv420Only:
-            []
+        case .yuv420AndChroma420: frame.auxiliaryRegionRects
+        case .chroma420Only: frame.regionRects
+        case .yuv420Only: []
         }
-        let mainFrameKey = MainFrameKey(
-            codecID: frame.codecID,
-            left: frame.destinationRect.left,
-            top: frame.destinationRect.top,
-            right: frame.destinationRect.right,
-            bottom: frame.destinationRect.bottom
-        )
         if layout != .chroma420Only {
-            mainImageBuffers[mainFrameKey] = firstResult.imageBuffer
+            try mainImageBuffers.update(surfaceID: frame.surfaceID, codecID: frame.codecID,
+                                        imageBuffer: firstResult.imageBuffer,
+                                        destinationRect: frame.destinationRect, regionRects: frame.regionRects,
+                                        surfaceRect: frame.surfaceRect)
         }
-        if layout == .yuv420Only {
+        if layout == .yuv420Only || chromaRegionRects.isEmpty {
             return RDPVideoToolboxDecodeResult(
                 imageBuffer: firstResult.imageBuffer,
                 samplePreparationMilliseconds: samplePreparationMilliseconds,
@@ -291,26 +278,25 @@ private final class RDPAVC444FrameDecoder {
                 usesHardwareAcceleration: usesHardwareAcceleration
             )
         }
+        let mainImageBuffer = try mainImageBuffers.frame(
+            surfaceID: frame.surfaceID, codecID: frame.codecID, width: width, height: height,
+            destinationRect: frame.destinationRect, regionRects: chromaRegionRects, surfaceRect: frame.surfaceRect
+        )
+        let auxiliaryImageBuffer = layout == .chroma420Only ? firstResult.imageBuffer : secondResult?.imageBuffer
+        let fullRect = RDPFrameRect(left: 0, top: 0, right: UInt16(clamping: width), bottom: UInt16(clamping: height))
+        // The retained main buffer already combines the per-region luma history.
+        // Both reconstruction paths receive that same canonical view.
         if let metalDecoder = availableMetalDecoder() {
             do {
-                if layout == .chroma420Only,
-                   let mainImageBuffer = mainImageBuffers[mainFrameKey]
-                {
-                    try metalDecoder.storeMainFrame(
-                        surfaceID: frame.surfaceID,
-                        codecID: frame.codecID,
-                        imageBuffer: mainImageBuffer,
-                        destinationRect: frame.destinationRect
-                    )
-                }
                 let pixelBuffer = try metalDecoder.decode(
                     surfaceID: frame.surfaceID,
                     codecID: frame.codecID,
-                    layout: layout,
-                    firstImageBuffer: firstResult.imageBuffer,
-                    secondImageBuffer: secondResult?.imageBuffer,
-                    destinationRect: frame.destinationRect,
-                    chromaRegionRects: chromaRegionRects
+                    layout: .yuv420AndChroma420,
+                    firstImageBuffer: mainImageBuffer,
+                    secondImageBuffer: auxiliaryImageBuffer,
+                    destinationRect: fullRect,
+                    chromaRegionRects: rdpAVCSourceRegions(chromaRegionRects, width: width, height: height,
+                                                         destinationRect: frame.destinationRect, surfaceRect: frame.surfaceRect)
                 )
                 return RDPVideoToolboxDecodeResult(
                     imageBuffer: pixelBuffer,
@@ -325,28 +311,17 @@ private final class RDPAVC444FrameDecoder {
             }
         }
 
-        let firstFrame = try yuv420Frame(from: firstResult.imageBuffer)
-        let secondFrame = try secondResult.map { try yuv420Frame(from: $0.imageBuffer) }
-        if layout == .chroma420Only,
-           let mainImageBuffer = mainImageBuffers[mainFrameKey]
-        {
-            _ = try frameStore.reconstruct(
-                surfaceID: frame.surfaceID,
-                codecID: frame.codecID,
-                layout: .yuv420Only,
-                firstFrame: yuv420Frame(from: mainImageBuffer),
-                secondFrame: nil,
-                destinationRect: frame.destinationRect
-            )
-        }
+        let firstFrame = try yuv420Frame(from: mainImageBuffer)
+        let secondFrame = try auxiliaryImageBuffer.map { try yuv420Frame(from: $0) }
         let reconstructed = try frameStore.reconstruct(
             surfaceID: frame.surfaceID,
             codecID: frame.codecID,
-            layout: layout,
+            layout: .yuv420AndChroma420,
             firstFrame: firstFrame,
             secondFrame: secondFrame,
-            destinationRect: frame.destinationRect,
-            chromaRegionRects: chromaRegionRects
+            destinationRect: fullRect,
+            chromaRegionRects: rdpAVCSourceRegions(chromaRegionRects, width: width, height: height,
+                                                 destinationRect: frame.destinationRect, surfaceRect: frame.surfaceRect)
         )
         let pixelBuffer = try makeBGRAImageBuffer(from: reconstructed)
         let imageConversionMilliseconds = Date().timeIntervalSince(conversionStartedAt) * 1000
@@ -366,33 +341,6 @@ private final class RDPAVC444FrameDecoder {
             didAttemptMetalDecoderCreation = true
         }
         return metalDecoder
-    }
-
-    private func sourceRegionRects(
-        _ regionRects: [RDPFrameRect],
-        destinationRect: RDPFrameRect
-    ) -> [RDPFrameRect] {
-        let regionsAreRelative = regionRects.allSatisfy {
-            $0.right <= destinationRect.width && $0.bottom <= destinationRect.height
-        }
-        guard !regionsAreRelative else {
-            return regionRects
-        }
-        return regionRects.compactMap { region in
-            let left = max(0, Int(region.left) - Int(destinationRect.left))
-            let top = max(0, Int(region.top) - Int(destinationRect.top))
-            let right = max(0, Int(region.right) - Int(destinationRect.left))
-            let bottom = max(0, Int(region.bottom) - Int(destinationRect.top))
-            guard right > left, bottom > top else {
-                return nil
-            }
-            return RDPFrameRect(
-                left: UInt16(clamping: left),
-                top: UInt16(clamping: top),
-                right: UInt16(clamping: right),
-                bottom: UInt16(clamping: bottom)
-            )
-        }
     }
 
     private func yuv420Frame(from imageBuffer: CVImageBuffer) throws -> RDPYUV420Frame {

@@ -3,15 +3,6 @@ import Foundation
 import Metal
 
 final class RDPAVC444MetalDecoder {
-    private struct MainFrameKey: Hashable {
-        var surfaceID: UInt16
-        var codecID: UInt16
-        var left: UInt16
-        var top: UInt16
-        var right: UInt16
-        var bottom: UInt16
-    }
-
     private struct WrappedTexture {
         var coreVideoTexture: CVMetalTexture
         var metalTexture: MTLTexture
@@ -29,7 +20,7 @@ final class RDPAVC444MetalDecoder {
     private let commandQueue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
-    private var mainFrames: [MainFrameKey: CVPixelBuffer] = [:]
+    private let mainFrames = RDPAVC444PixelBufferStore()
 
     init?() {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -56,7 +47,7 @@ final class RDPAVC444MetalDecoder {
     }
 
     func reset() {
-        mainFrames.removeAll()
+        mainFrames.reset()
         if let textureCache {
             CVMetalTextureCacheFlush(textureCache, 0)
         }
@@ -66,7 +57,9 @@ final class RDPAVC444MetalDecoder {
         surfaceID: UInt16,
         codecID: UInt16,
         imageBuffer: CVImageBuffer,
-        destinationRect: RDPFrameRect
+        destinationRect: RDPFrameRect,
+        lumaRegionRects: [RDPFrameRect]? = nil,
+        surfaceRect: RDPFrameRect? = nil
     ) throws {
         guard codecID == RDPGFXCodecID.avc444 || codecID == RDPGFXCodecID.avc444v2 else {
             throw RDPAVC444DecodeError.unsupportedCodec(codecID)
@@ -81,11 +74,8 @@ final class RDPAVC444MetalDecoder {
         else {
             throw RDPAVC444DecodeError.invalidYUV420Layout
         }
-        mainFrames[mainFrameKey(
-            surfaceID: surfaceID,
-            codecID: codecID,
-            destinationRect: destinationRect
-        )] = imageBuffer
+        try mainFrames.update(surfaceID: surfaceID, codecID: codecID, imageBuffer: imageBuffer,
+                              destinationRect: destinationRect, regionRects: lumaRegionRects, surfaceRect: surfaceRect)
     }
 
     func decode(
@@ -95,17 +85,14 @@ final class RDPAVC444MetalDecoder {
         firstImageBuffer: CVImageBuffer,
         secondImageBuffer: CVImageBuffer?,
         destinationRect: RDPFrameRect,
-        chromaRegionRects: [RDPFrameRect]
+        chromaRegionRects: [RDPFrameRect],
+        lumaRegionRects: [RDPFrameRect]? = nil,
+        surfaceRect: RDPFrameRect? = nil
     ) throws -> CVPixelBuffer {
         guard codecID == RDPGFXCodecID.avc444 || codecID == RDPGFXCodecID.avc444v2 else {
             throw RDPAVC444DecodeError.unsupportedCodec(codecID)
         }
-        let key = mainFrameKey(
-            surfaceID: surfaceID,
-            codecID: codecID,
-            destinationRect: destinationRect
-        )
-        let mainImageBuffer: CVImageBuffer
+        var mainImageBuffer: CVImageBuffer
         let auxiliaryImageBuffer: CVImageBuffer?
         switch layout {
         case .yuv420AndChroma420:
@@ -118,10 +105,11 @@ final class RDPAVC444MetalDecoder {
             mainImageBuffer = firstImageBuffer
             auxiliaryImageBuffer = nil
         case .chroma420Only:
-            guard let previousMainFrame = mainFrames[key] else {
-                throw RDPAVC444DecodeError.missingLumaSubframe
-            }
-            mainImageBuffer = previousMainFrame
+            mainImageBuffer = try mainFrames.frame(
+                surfaceID: surfaceID, codecID: codecID,
+                width: CVPixelBufferGetWidth(firstImageBuffer), height: CVPixelBufferGetHeight(firstImageBuffer),
+                destinationRect: destinationRect, regionRects: chromaRegionRects, surfaceRect: surfaceRect
+            )
             auxiliaryImageBuffer = firstImageBuffer
         }
 
@@ -143,7 +131,14 @@ final class RDPAVC444MetalDecoder {
             throw RDPAVC444DecodeError.mismatchedSubframeDimensions
         }
         if layout != .chroma420Only {
-            mainFrames[key] = firstImageBuffer
+            try storeMainFrame(surfaceID: surfaceID, codecID: codecID, imageBuffer: firstImageBuffer,
+                               destinationRect: destinationRect, lumaRegionRects: lumaRegionRects, surfaceRect: surfaceRect)
+            if auxiliaryImageBuffer != nil, !chromaRegionRects.isEmpty {
+                mainImageBuffer = try mainFrames.frame(
+                    surfaceID: surfaceID, codecID: codecID, width: width, height: height,
+                    destinationRect: destinationRect, regionRects: chromaRegionRects, surfaceRect: surfaceRect
+                )
+            }
         }
 
         let output = try makeOutputPixelBuffer(width: width, height: height)
@@ -156,7 +151,8 @@ final class RDPAVC444MetalDecoder {
             height: height,
             planeIndex: 0
         )
-        let regions = chromaRegionRects.map {
+        let regions = rdpAVCSourceRegions(chromaRegionRects, width: width, height: height,
+                                         destinationRect: destinationRect, surfaceRect: surfaceRect).map {
             SIMD4<UInt32>(UInt32($0.left), UInt32($0.top), UInt32($0.right), UInt32($0.bottom))
         }
         let bufferedRegions = regions.isEmpty ? [SIMD4<UInt32>(repeating: 0)] : regions
@@ -206,21 +202,6 @@ final class RDPAVC444MetalDecoder {
         return (pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
             || pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
             && CVPixelBufferGetPlaneCount(imageBuffer) == 2
-    }
-
-    private func mainFrameKey(
-        surfaceID: UInt16,
-        codecID: UInt16,
-        destinationRect: RDPFrameRect
-    ) -> MainFrameKey {
-        MainFrameKey(
-            surfaceID: surfaceID,
-            codecID: codecID,
-            left: destinationRect.left,
-            top: destinationRect.top,
-            right: destinationRect.right,
-            bottom: destinationRect.bottom
-        )
     }
 
     private func makeOutputPixelBuffer(width: Int, height: Int) throws -> CVPixelBuffer {

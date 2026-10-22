@@ -285,8 +285,13 @@ private extension RDPGraphicsFrameSnapshot {
         guard contentKind == .video else {
             return false
         }
-        if avc444SubframeLayout == .chroma420Only {
-            return false
+        if let layout = avc444SubframeLayout {
+            guard layout != .chroma420Only,
+                  let surfaceRect,
+                  rdpAVCRegionsCover(width: Int(surfaceRect.width), height: Int(surfaceRect.height),
+                                     regions: regionRects) else {
+                return false
+            }
         }
 
         let types = videoNalUnitTypes
@@ -384,6 +389,24 @@ final class RDPDecodedVideoSurfaceCompositor {
             return RDPDecodedFramePresentation(frame: frame, imageBuffer: decodedImageBuffer)
         }
 
+        var frame = frame
+        let codedWidth = CVPixelBufferGetWidth(decodedImageBuffer)
+        let codedHeight = CVPixelBufferGetHeight(decodedImageBuffer)
+        let sourceOrigin = rdpAVCSourceOrigin(width: codedWidth, height: codedHeight,
+                                             destinationRect: frame.destinationRect, surfaceRect: frame.surfaceRect)
+        if sourceOrigin.x != 0 || sourceOrigin.y != 0 {
+            func surfaceRegions(_ regions: [RDPFrameRect]) -> [RDPFrameRect] {
+                rdpAVCSourceRegions(regions, width: codedWidth, height: codedHeight,
+                                    destinationRect: frame.destinationRect, surfaceRect: frame.surfaceRect).map { rect in
+                    RDPFrameRect(left: UInt16(clamping: Int(rect.left) + sourceOrigin.x),
+                                 top: UInt16(clamping: Int(rect.top) + sourceOrigin.y),
+                                 right: UInt16(clamping: Int(rect.right) + sourceOrigin.x),
+                                 bottom: UInt16(clamping: Int(rect.bottom) + sourceOrigin.y))
+                }
+            }
+            frame.regionRects = surfaceRegions(frame.regionRects)
+            frame.auxiliaryRegionRects = surfaceRegions(frame.auxiliaryRegionRects)
+        }
         let updateRect = frame.destinationRect
         let requestedSurfaceRect = frame.surfaceRect ?? inferredSurfaceRect(from: updateRect)
         let surfaceWidth = Int(requestedSurfaceRect.width)
@@ -428,11 +451,14 @@ final class RDPDecodedVideoSurfaceCompositor {
         try materializeDirectSurface(surfaceID: frame.surfaceID)
         var surface = surface(for: frame.surfaceID, width: surfaceWidth, height: surfaceHeight)
         let source = try imageConverter.bgraData(from: decodedImageBuffer)
-        let copyRegions = videoCopyRegions(
+        let hasEmptyAVC444Mask = frame.avc444SubframeLayout != nil
+            && frame.regionRects.isEmpty && frame.auxiliaryRegionRects.isEmpty
+        let copyRegions = hasEmptyAVC444Mask ? [] : videoCopyRegions(
             updateRect: updateRect,
             regionRects: frame.regionRects + frame.auxiliaryRegionRects,
             sourceWidth: source.width,
             sourceHeight: source.height,
+            sourceOrigin: sourceOrigin,
             surfaceWidth: surface.width,
             surfaceHeight: surface.height
         )
@@ -466,6 +492,10 @@ final class RDPDecodedVideoSurfaceCompositor {
         guard frame.codecID == RDPGFXCodecID.avc444 || frame.codecID == RDPGFXCodecID.avc444v2 else {
             return true
         }
+        if frame.avc444SubframeLayout != nil,
+           frame.regionRects.isEmpty, frame.auxiliaryRegionRects.isEmpty {
+            return false
+        }
         switch frame.avc444SubframeLayout {
         case .yuv420Only:
             return chromaEnhancedAVC444Surfaces.contains(frame.surfaceID) == false
@@ -486,7 +516,8 @@ final class RDPDecodedVideoSurfaceCompositor {
         surfaceRect: RDPFrameRect
     ) -> Bool {
         regions.contains {
-            outputRegionRect($0, updateRect: frame.destinationRect, surfaceRect: surfaceRect) == surfaceRect
+            outputRegionRect($0, updateRect: frame.destinationRect, surfaceRect: surfaceRect,
+                             regionCoordinatesAreSurface: frame.contentKind == .video) == surfaceRect
         }
     }
 
@@ -526,7 +557,8 @@ final class RDPDecodedVideoSurfaceCompositor {
         outputFrame.surfaceRect = outputRect
         outputFrame.destinationRect = outputRect
         let regionRects = (frame.regionRects + frame.auxiliaryRegionRects).compactMap {
-            outputRegionRect($0, updateRect: frame.destinationRect, surfaceRect: surfaceRect)
+            outputRegionRect($0, updateRect: frame.destinationRect, surfaceRect: surfaceRect,
+                             regionCoordinatesAreSurface: frame.contentKind == .video)
         }
         outputFrame.regionRects = regionRects.isEmpty ? [outputRect] : regionRects
         outputFrame.auxiliaryRegionRects = []
@@ -616,7 +648,8 @@ final class RDPDecodedVideoSurfaceCompositor {
     ) -> RDPGraphicsFrameSnapshot {
         let destinationRect = frame.mappedOutputRect ?? surfaceRect
         var regionRects = (frame.regionRects + frame.auxiliaryRegionRects).compactMap {
-            outputRegionRect($0, updateRect: frame.destinationRect, surfaceRect: surfaceRect)
+            outputRegionRect($0, updateRect: frame.destinationRect, surfaceRect: surfaceRect,
+                             regionCoordinatesAreSurface: frame.contentKind == .video)
         }
         if let mappedOutputRect = frame.mappedOutputRect {
             regionRects = regionRects.map {
@@ -860,35 +893,17 @@ private func videoCopyRegions(
     regionRects: [RDPFrameRect],
     sourceWidth: Int,
     sourceHeight: Int,
+    sourceOrigin: (x: Int, y: Int),
     surfaceWidth: Int,
     surfaceHeight: Int
 ) -> [RDPVideoCopyRegion] {
-    let regions = regionRects.isEmpty
-        ? [RDPFrameRect(left: 0, top: 0, right: updateRect.width, bottom: updateRect.height)]
-        : regionRects
-    let regionsAreRelative = regions.allSatisfy {
-        $0.left <= updateRect.width
-            && $0.top <= updateRect.height
-            && $0.right <= updateRect.width
-            && $0.bottom <= updateRect.height
-    }
-
+    let regions = regionRects.isEmpty ? [updateRect] : regionRects
+    let origin = sourceOrigin
     return regions.compactMap { region in
-        let sourceLeft: Int
-        let sourceTop: Int
-        let destinationLeft: Int
-        let destinationTop: Int
-        if regionsAreRelative {
-            sourceLeft = Int(region.left)
-            sourceTop = Int(region.top)
-            destinationLeft = Int(updateRect.left) + sourceLeft
-            destinationTop = Int(updateRect.top) + sourceTop
-        } else {
-            sourceLeft = Int(region.left) - Int(updateRect.left)
-            sourceTop = Int(region.top) - Int(updateRect.top)
-            destinationLeft = Int(region.left)
-            destinationTop = Int(region.top)
-        }
+        let sourceLeft = Int(region.left) - origin.x
+        let sourceTop = Int(region.top) - origin.y
+        let destinationLeft = Int(region.left)
+        let destinationTop = Int(region.top)
 
         return clippedVideoCopyRegion(
             sourceLeft: sourceLeft,
@@ -949,9 +964,11 @@ private func clippedVideoCopyRegion(
 private func outputRegionRect(
     _ region: RDPFrameRect,
     updateRect: RDPFrameRect,
-    surfaceRect: RDPFrameRect
+    surfaceRect: RDPFrameRect,
+    regionCoordinatesAreSurface: Bool = false
 ) -> RDPFrameRect? {
-    let relative = region.right <= updateRect.width && region.bottom <= updateRect.height
+    let relative = !regionCoordinatesAreSurface
+        && region.right <= updateRect.width && region.bottom <= updateRect.height
     let outputLeft = relative
         ? Int(surfaceRect.left) + Int(updateRect.left) + Int(region.left)
         : Int(surfaceRect.left) + Int(region.left)

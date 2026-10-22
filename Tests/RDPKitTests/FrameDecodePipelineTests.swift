@@ -443,6 +443,61 @@ import Testing
     #expect(backlog.waitingForVideoResync == false)
 }
 
+@Test func decodeBacklogPreservesAVC444HistoryAcrossPartialLumaIDR() {
+    var backlog = RDPFrameDecodeBacklog(limits: frameCountOnlyLimits(maxQueuedVideoFrames: 1))
+    _ = backlog.append(pendingVideoFrame(id: 1, nalUnitTypes: [1]))
+    var partial = pendingVideoFrame(id: 2, nalUnitTypes: [7, 8, 5])
+    partial.frame.surfaceRect = RDPFrameRect(left: 0, top: 0, right: 32, bottom: 16)
+    partial.frame.destinationRect = RDPFrameRect(left: 0, top: 0, right: 16, bottom: 16)
+    partial.frame.regionRects = [partial.frame.destinationRect]
+    partial.frame.avc444SubframeLayout = .yuv420Only
+    #expect(backlog.append(partial).isEmpty)
+    #expect(backlog.frames.map(\.frame.frameID) == [1, 2])
+    #expect(backlog.frames.allSatisfy { !$0.resetDecoderBeforeDecode })
+
+    var complete = partial
+    complete.frame.frameID = 3
+    complete.frame.destinationRect = RDPFrameRect(left: 0, top: 0, right: 32, bottom: 16)
+    complete.frame.regionRects = [complete.frame.destinationRect]
+    #expect(backlog.append(complete).map(\.frame.frameID) == [1, 2])
+    #expect(backlog.frames.map(\.frame.frameID) == [3])
+    #expect(backlog.frames.first?.resetDecoderBeforeDecode == true)
+}
+
+@Test func decodedVideoCompositorIgnoresExplicitlyEmptyAVC444Masks() throws {
+    let compositor = RDPDecodedVideoSurfaceCompositor()
+    let full = RDPFrameRect(left: 0, top: 0, right: 4, bottom: 2)
+    var frame = videoFrame(id: 1, surfaceRect: full, destinationRect: full,
+                           regionRects: [full], nalUnitTypes: [1])
+    frame.avc444SubframeLayout = .yuv420Only
+    _ = try compositor.presentation(for: frame,
+        decodedImageBuffer: bgraPixelBuffer(width: 4, height: 2, pixel: [10, 20, 30, 255]))
+    frame.regionRects = []
+    let noUpdate = try compositor.presentation(for: frame,
+        decodedImageBuffer: bgraPixelBuffer(width: 4, height: 2, pixel: [99, 99, 99, 255]))
+    #expect(try bgraPixel(atX: 0, y: 0, in: noUpdate.imageBuffer) == [10, 20, 30, 255])
+}
+
+@Test func decodedVideoCompositorKeepsFullCodedImageCoordinatesForAVCBounds() throws {
+    let compositor = RDPDecodedVideoSurfaceCompositor()
+    let surface = RDPFrameRect(left: 0, top: 0, right: 4, bottom: 2)
+    let right = RDPFrameRect(left: 2, top: 0, right: 4, bottom: 2)
+    let source = try bgraPixelBuffer(width: 4, height: 2, pixel: [10, 20, 30, 255])
+    CVPixelBufferLockBaseAddress(source, [])
+    let base = try #require(CVPixelBufferGetBaseAddress(source))
+    let stride = CVPixelBufferGetBytesPerRow(source)
+    for row in 0 ..< 2 {
+        for column in 2 ..< 4 {
+            base.advanced(by: row * stride + column * 4).storeBytes(of: UInt8(99), as: UInt8.self)
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(source, [])
+    let presentation = try compositor.presentation(
+        for: videoFrame(id: 1, surfaceRect: surface, destinationRect: right,
+                        regionRects: [right], nalUnitTypes: [1]), decodedImageBuffer: source)
+    #expect(try bgraPixel(atX: 2, y: 0, in: presentation.imageBuffer) == [99, 20, 30, 255])
+}
+
 @Test func decodeBacklogTrimsVideoOverflowToNewestResyncFrame() {
     var backlog = RDPFrameDecodeBacklog(limits: frameCountOnlyLimits(maxQueuedVideoFrames: 3))
 

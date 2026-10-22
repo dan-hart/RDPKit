@@ -46,19 +46,10 @@ struct RDPAVC444ReconstructedFrame: Equatable, Sendable {
 }
 
 final class RDPAVC444FrameStore {
-    private struct MainFrameKey: Hashable {
-        var surfaceID: UInt16
-        var codecID: UInt16
-        var left: UInt16
-        var top: UInt16
-        var right: UInt16
-        var bottom: UInt16
-    }
-
-    private var mainFrames: [MainFrameKey: RDPYUV420Frame] = [:]
+    private let lumaStore = RDPAVC444LumaStore<RDPYUV420Frame>()
 
     func reset() {
-        mainFrames.removeAll()
+        lumaStore.reset()
     }
 
     func reconstruct(
@@ -68,7 +59,9 @@ final class RDPAVC444FrameStore {
         firstFrame: RDPYUV420Frame,
         secondFrame: RDPYUV420Frame?,
         destinationRect: RDPFrameRect? = nil,
-        chromaRegionRects: [RDPFrameRect] = []
+        chromaRegionRects: [RDPFrameRect] = [],
+        lumaRegionRects: [RDPFrameRect]? = nil,
+        surfaceRect: RDPFrameRect? = nil
     ) throws -> RDPAVC444ReconstructedFrame {
         let destinationRect = destinationRect ?? RDPFrameRect(
             left: 0,
@@ -76,15 +69,7 @@ final class RDPAVC444FrameStore {
             right: UInt16(clamping: firstFrame.width),
             bottom: UInt16(clamping: firstFrame.height)
         )
-        let mainFrameKey = MainFrameKey(
-            surfaceID: surfaceID,
-            codecID: codecID,
-            left: destinationRect.left,
-            top: destinationRect.top,
-            right: destinationRect.right,
-            bottom: destinationRect.bottom
-        )
-        let mainFrame: RDPYUV420Frame
+        var mainFrame: RDPYUV420Frame
         let chromaFrame: RDPYUV420Frame?
         switch layout {
         case .yuv420AndChroma420:
@@ -97,10 +82,12 @@ final class RDPAVC444FrameStore {
             mainFrame = firstFrame
             chromaFrame = nil
         case .chroma420Only:
-            guard let previousMainFrame = mainFrames[mainFrameKey] else {
-                throw RDPAVC444DecodeError.missingLumaSubframe
-            }
-            mainFrame = previousMainFrame
+            mainFrame = try lumaStore.frame(
+                surfaceID: surfaceID, codecID: codecID,
+                width: firstFrame.width, height: firstFrame.height,
+                destinationRect: destinationRect, regionRects: chromaRegionRects, surfaceRect: surfaceRect,
+                extract: extractYUV420Frame
+            )
             chromaFrame = firstFrame
         }
 
@@ -120,13 +107,27 @@ final class RDPAVC444FrameStore {
             throw RDPAVC444DecodeError.invalidYUV420Layout
         }
         if layout != .chroma420Only {
-            mainFrames[mainFrameKey] = mainFrame
+            try lumaStore.update(
+                surfaceID: surfaceID, codecID: codecID,
+                width: mainFrame.width, height: mainFrame.height,
+                destinationRect: destinationRect, regionRects: lumaRegionRects, surfaceRect: surfaceRect,
+                frame: mainFrame, merge: mergeYUV420Frame
+            )
+        }
+        if chromaFrame != nil, layout != .chroma420Only, !chromaRegionRects.isEmpty {
+            mainFrame = try lumaStore.frame(
+                surfaceID: surfaceID, codecID: codecID,
+                width: firstFrame.width, height: firstFrame.height,
+                destinationRect: destinationRect, regionRects: chromaRegionRects, surfaceRect: surfaceRect,
+                extract: extractYUV420Frame
+            )
         }
         let chromaMask = chromaFrame.map { _ in
             avc444ChromaMask(
                 width: mainFrame.width,
                 height: mainFrame.height,
-                regionRects: chromaRegionRects
+                regionRects: rdpAVCSourceRegions(chromaRegionRects, width: mainFrame.width,
+                                                  height: mainFrame.height, destinationRect: destinationRect, surfaceRect: surfaceRect)
             )
         }
         var bgra = Data(repeating: 0, count: mainFrame.width * mainFrame.height * 4)

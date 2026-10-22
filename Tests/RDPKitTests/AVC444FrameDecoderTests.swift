@@ -237,6 +237,241 @@ import Testing
     }
 }
 
+@Test func AVC444RetainsLumaAcrossChangingBoundingRectangles() throws {
+    for codecID in [RDPGFXCodecID.avc444, RDPGFXCodecID.avc444v2] {
+        let cpu = RDPAVC444FrameStore()
+        let metal = try #require(RDPAVC444MetalDecoder())
+        let full = RDPFrameRect(left: 0, top: 0, right: 32, bottom: 16)
+        let left = RDPFrameRect(left: 0, top: 0, right: 16, bottom: 16)
+        let right = RDPFrameRect(left: 16, top: 0, right: 32, bottom: 16)
+        func frame(_ y: UInt8) throws -> RDPYUV420Frame {
+            try RDPYUV420Frame(width: 32, height: 16,
+                y: [UInt8](repeating: y, count: 512),
+                u: [UInt8](repeating: 100, count: 128),
+                v: [UInt8](repeating: 150, count: 128))
+        }
+        // The coded image stays full-size; destRect bounds only this update.
+        for (rect, main) in [(full, try frame(90)), (left, try frame(120))] {
+            _ = try cpu.reconstruct(surfaceID: 7, codecID: codecID, layout: .yuv420Only,
+                firstFrame: main, secondFrame: nil, destinationRect: rect)
+            _ = try metal.decode(surfaceID: 7, codecID: codecID, layout: .yuv420Only,
+                firstImageBuffer: nv12PixelBuffer(from: main), secondImageBuffer: nil,
+                destinationRect: rect, chromaRegionRects: [])
+        }
+        let auxiliary = try frame(40)
+        for rect in [right, left, full] {
+            let expected = try cpu.reconstruct(surfaceID: 7, codecID: codecID, layout: .chroma420Only,
+                firstFrame: auxiliary, secondFrame: nil, destinationRect: rect, chromaRegionRects: [rect])
+            let actual = try metal.decode(surfaceID: 7, codecID: codecID, layout: .chroma420Only,
+                firstImageBuffer: nv12PixelBuffer(from: auxiliary), secondImageBuffer: nil,
+                destinationRect: rect, chromaRegionRects: [rect])
+            #expect(try bgraData(from: actual) == expected.bgra)
+            if rect == right || rect == full {
+                // Odd x/even y samples auxiliary U/V directly in AVC444 v1.
+                let reference = try RDPAVC444FrameStore().reconstruct(surfaceID: 7, codecID: codecID,
+                    layout: .yuv420AndChroma420, firstFrame: frame(90), secondFrame: auxiliary,
+                    chromaRegionRects: [full])
+                #expect(pixel(x: 17, y: 0, in: expected) == pixel(x: 17, y: 0, in: reference))
+            }
+            if rect == left || rect == full {
+                let reference = try RDPAVC444FrameStore().reconstruct(surfaceID: 7, codecID: codecID,
+                    layout: .yuv420AndChroma420, firstFrame: frame(120), secondFrame: auxiliary,
+                    chromaRegionRects: [full])
+                #expect(pixel(x: 1, y: 0, in: expected) == pixel(x: 1, y: 0, in: reference))
+            }
+        }
+    }
+}
+
+@Test func AVC444LumaMaskCoverageAndDimensionChangesAreExplicit() throws {
+    let store = RDPAVC444FrameStore()
+    let metal = try #require(RDPAVC444MetalDecoder())
+    let full = RDPFrameRect(left: 0, top: 0, right: 16, bottom: 16)
+    let left = RDPFrameRect(left: 0, top: 0, right: 8, bottom: 16)
+    let right = RDPFrameRect(left: 8, top: 0, right: 16, bottom: 16)
+    let main = try yuv420Frame(y: 90, u: 100, v: 150)
+    let auxiliary = try yuv420Frame(y: 40, u: 50, v: 190)
+    for regions in [[left], []] {
+        _ = try store.reconstruct(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+            layout: .yuv420Only, firstFrame: main, secondFrame: nil,
+            destinationRect: full, lumaRegionRects: regions)
+        try metal.storeMainFrame(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+            imageBuffer: nv12PixelBuffer(from: main), destinationRect: full, lumaRegionRects: regions)
+    }
+    for (surfaceID, codecID, region) in [(UInt16(1), RDPGFXCodecID.avc444, right),
+                                        (2, RDPGFXCodecID.avc444, left),
+                                        (1, RDPGFXCodecID.avc444v2, left)] {
+        #expect(throws: RDPAVC444DecodeError.missingLumaSubframe) {
+            try store.reconstruct(surfaceID: surfaceID, codecID: codecID,
+                layout: .chroma420Only, firstFrame: auxiliary, secondFrame: nil,
+                destinationRect: full, chromaRegionRects: [region])
+        }
+        #expect(throws: RDPAVC444DecodeError.missingLumaSubframe) {
+            try metal.decode(surfaceID: surfaceID, codecID: codecID,
+                layout: .chroma420Only, firstImageBuffer: nv12PixelBuffer(from: auxiliary),
+                secondImageBuffer: nil, destinationRect: full, chromaRegionRects: [region])
+        }
+    }
+    let result = try store.reconstruct(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+        layout: .chroma420Only, firstFrame: auxiliary, secondFrame: nil,
+        destinationRect: full, chromaRegionRects: [left])
+    #expect(pixel(x: 1, y: 0, in: result) == bgra(y: 90, u: 50, v: 190))
+    store.reset()
+    metal.reset()
+    #expect(throws: RDPAVC444DecodeError.missingLumaSubframe) {
+        try store.reconstruct(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+            layout: .chroma420Only, firstFrame: auxiliary, secondFrame: nil,
+            destinationRect: full, chromaRegionRects: [left])
+    }
+}
+
+@Test func AVC444PixelBufferHistoryNeverMutatesRetainedDecoderBuffers() throws {
+    let store = RDPAVC444PixelBufferStore()
+    let full = RDPFrameRect(left: 0, top: 0, right: 16, bottom: 16)
+    let left = RDPFrameRect(left: 0, top: 0, right: 8, bottom: 16)
+    let original = try nv12PixelBuffer(from: yuv420Frame(y: 90, u: 100, v: 150))
+    try store.update(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+                     imageBuffer: original, destinationRect: full, regionRects: [full])
+    let retained = try store.frame(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+        width: 16, height: 16, destinationRect: full, regionRects: [full])
+    #expect(retained === original)
+    let changed = try nv12PixelBuffer(from: yuv420Frame(y: 120, u: 100, v: 150))
+    try store.update(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+                     imageBuffer: changed, destinationRect: full, regionRects: [left])
+    let updated = try store.frame(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+        width: 16, height: 16, destinationRect: full, regionRects: [full])
+    #expect(updated !== retained)
+    for (buffer, x, expected) in [(retained, 1, UInt8(90)), (changed, 9, 120),
+                                   (updated, 1, 120), (updated, 9, 90)] {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        let base = try #require(CVPixelBufferGetBaseAddressOfPlane(buffer, 0))
+        #expect(base.load(fromByteOffset: x, as: UInt8.self) == expected)
+        CVPixelBufferUnlockBaseAddress(buffer, .readOnly)
+    }
+}
+
+@Test func AVC444ResolutionChangeDiscardsPaddedOldCoverage() throws {
+    let store = RDPAVC444PixelBufferStore()
+    func buffer(width: Int) throws -> CVPixelBuffer {
+        try nv12PixelBuffer(from: RDPYUV420Frame(width: width, height: 32,
+            y: [UInt8](repeating: 90, count: width * 32),
+            u: [UInt8](repeating: 100, count: width * 8),
+            v: [UInt8](repeating: 150, count: width * 8)))
+    }
+    let oldBounds = RDPFrameRect(left: 0, top: 0, right: 32, bottom: 24)
+    try store.update(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+        imageBuffer: buffer(width: 32), destinationRect: oldBounds, regionRects: [oldBounds])
+    let newBounds = RDPFrameRect(left: 0, top: 0, right: 16, bottom: 24)
+    try store.update(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+        imageBuffer: buffer(width: 16), destinationRect: newBounds,
+        regionRects: [RDPFrameRect(left: 0, top: 0, right: 8, bottom: 24)])
+    #expect(throws: RDPAVC444DecodeError.missingLumaSubframe) {
+        try store.frame(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+            width: 16, height: 32, destinationRect: newBounds,
+            regionRects: [RDPFrameRect(left: 8, top: 0, right: 16, bottom: 24)])
+    }
+}
+
+@Test func AVC444ChromaOnlyCannotReuseLumaAfterCodedSizeChange() throws {
+    let cpu = RDPAVC444FrameStore()
+    let metal = try #require(RDPAVC444MetalDecoder())
+    let full = RDPFrameRect(left: 0, top: 0, right: 32, bottom: 16)
+    let smaller = RDPFrameRect(left: 0, top: 0, right: 16, bottom: 16)
+    let old = try RDPYUV420Frame(width: 32, height: 16,
+        y: [UInt8](repeating: 90, count: 512), u: [UInt8](repeating: 100, count: 128),
+        v: [UInt8](repeating: 150, count: 128))
+    _ = try cpu.reconstruct(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+        layout: .yuv420Only, firstFrame: old, secondFrame: nil, destinationRect: full)
+    try metal.storeMainFrame(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+        imageBuffer: nv12PixelBuffer(from: old), destinationRect: full)
+    let auxiliary = try yuv420Frame(y: 40, u: 50, v: 190)
+    #expect(throws: RDPAVC444DecodeError.missingLumaSubframe) {
+        try cpu.reconstruct(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+            layout: .chroma420Only, firstFrame: auxiliary, secondFrame: nil,
+            destinationRect: smaller, chromaRegionRects: [smaller])
+    }
+    #expect(throws: RDPAVC444DecodeError.missingLumaSubframe) {
+        try metal.decode(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+            layout: .chroma420Only, firstImageBuffer: nv12PixelBuffer(from: auxiliary),
+            secondImageBuffer: nil, destinationRect: smaller, chromaRegionRects: [smaller])
+    }
+}
+
+@Test func AVC444FullAndRegionLocalLumaUpdatesShareSurfaceHistory() throws {
+    let cpu = RDPAVC444FrameStore()
+    let metal = try #require(RDPAVC444MetalDecoder())
+    let full = RDPFrameRect(left: 0, top: 0, right: 32, bottom: 16)
+    let left = RDPFrameRect(left: 0, top: 0, right: 16, bottom: 16)
+    let right = RDPFrameRect(left: 16, top: 0, right: 32, bottom: 16)
+    func wide(_ y: UInt8) throws -> RDPYUV420Frame {
+        try RDPYUV420Frame(width: 32, height: 16,
+            y: [UInt8](repeating: y, count: 512), u: [UInt8](repeating: 100, count: 128),
+            v: [UInt8](repeating: 150, count: 128))
+    }
+    for (main, destination, regions) in [(try wide(90), full, [full]),
+                                        (try yuv420Frame(y: 120, u: 100, v: 150), right, [left]),
+                                        (try wide(160), full, [left])] {
+        _ = try cpu.reconstruct(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+            layout: .yuv420Only, firstFrame: main, secondFrame: nil,
+            destinationRect: destination, lumaRegionRects: regions, surfaceRect: full)
+        try metal.storeMainFrame(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+            imageBuffer: nv12PixelBuffer(from: main), destinationRect: destination,
+            lumaRegionRects: regions, surfaceRect: full)
+    }
+    let auxiliary = try wide(40)
+    let result = try cpu.reconstruct(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+        layout: .chroma420Only, firstFrame: auxiliary, secondFrame: nil,
+        destinationRect: full, chromaRegionRects: [full], surfaceRect: full)
+    let gpu = try metal.decode(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+        layout: .chroma420Only, firstImageBuffer: nv12PixelBuffer(from: auxiliary),
+        secondImageBuffer: nil, destinationRect: full, chromaRegionRects: [full], surfaceRect: full)
+    #expect(try bgraData(from: gpu) == result.bgra)
+    #expect(pixel(x: 1, y: 0, in: result) == bgra(y: 160, u: 100, v: 150))
+    #expect(pixel(x: 17, y: 0, in: result) == bgra(y: 120, u: 100, v: 150))
+}
+
+@Test func AVC444OddOriginLocalFramesRetainTheirSamplingPhase() throws {
+    let cpu = RDPAVC444FrameStore()
+    let metal = try #require(RDPAVC444MetalDecoder())
+    let surface = RDPFrameRect(left: 0, top: 0, right: 32, bottom: 32)
+    let destination = RDPFrameRect(left: 1, top: 1, right: 17, bottom: 17)
+    let local = RDPFrameRect(left: 0, top: 0, right: 16, bottom: 16)
+    let main = try yuv420Frame(y: 90, u: 100, v: 150)
+    let auxiliary = try yuv420Frame(y: 40, u: 50, v: 190)
+    _ = try cpu.reconstruct(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+        layout: .yuv420Only, firstFrame: main, secondFrame: nil,
+        destinationRect: destination, lumaRegionRects: [local], surfaceRect: surface)
+    try metal.storeMainFrame(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+        imageBuffer: nv12PixelBuffer(from: main), destinationRect: destination,
+        lumaRegionRects: [local], surfaceRect: surface)
+    let expected = try cpu.reconstruct(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+        layout: .chroma420Only, firstFrame: auxiliary, secondFrame: nil,
+        destinationRect: destination, chromaRegionRects: [local], surfaceRect: surface)
+    let actual = try metal.decode(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+        layout: .chroma420Only, firstImageBuffer: nv12PixelBuffer(from: auxiliary),
+        secondImageBuffer: nil, destinationRect: destination, chromaRegionRects: [local], surfaceRect: surface)
+    #expect(try bgraData(from: actual) == expected.bgra)
+    #expect(pixel(x: 1, y: 0, in: expected) == bgra(y: 90, u: 50, v: 190))
+
+    let fullMain = try RDPYUV420Frame(width: 32, height: 32,
+        y: [UInt8](repeating: 120, count: 1024), u: [UInt8](repeating: 100, count: 256),
+        v: [UInt8](repeating: 150, count: 256))
+    _ = try cpu.reconstruct(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+        layout: .yuv420Only, firstFrame: fullMain, secondFrame: nil, destinationRect: surface)
+    try metal.storeMainFrame(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+        imageBuffer: nv12PixelBuffer(from: fullMain), destinationRect: surface)
+    #expect(throws: RDPAVC444DecodeError.missingLumaSubframe) {
+        try cpu.reconstruct(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+            layout: .chroma420Only, firstFrame: auxiliary, secondFrame: nil,
+            destinationRect: destination, chromaRegionRects: [local], surfaceRect: surface)
+    }
+    #expect(throws: RDPAVC444DecodeError.missingLumaSubframe) {
+        try metal.decode(surfaceID: 1, codecID: RDPGFXCodecID.avc444,
+            layout: .chroma420Only, firstImageBuffer: nv12PixelBuffer(from: auxiliary),
+            secondImageBuffer: nil, destinationRect: destination, chromaRegionRects: [local], surfaceRect: surface)
+    }
+}
+
 private func yuv420Frame(y: UInt8, u: UInt8, v: UInt8) throws -> RDPYUV420Frame {
     try RDPYUV420Frame(
         width: 16,
