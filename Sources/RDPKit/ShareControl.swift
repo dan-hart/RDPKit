@@ -396,6 +396,26 @@ struct RDPShareDataPDU: Equatable, Sendable {
         )
     }
 
+    var monitorLayoutDefinitions: [RDPMonitorDefinition]? {
+        guard let count = monitorLayoutMonitorCount,
+              payload.count >= 4,
+              Int(count) == (payload.count - 4) / 20,
+              (payload.count - 4).isMultiple(of: 20)
+        else {
+            return nil
+        }
+        return (0 ..< Int(count)).map { index in
+            let offset = 4 + index * 20
+            return RDPMonitorDefinition(
+                left: Int32(bitPattern: payload.littleEndianUInt32(at: offset)),
+                top: Int32(bitPattern: payload.littleEndianUInt32(at: offset + 4)),
+                right: Int32(bitPattern: payload.littleEndianUInt32(at: offset + 8)),
+                bottom: Int32(bitPattern: payload.littleEndianUInt32(at: offset + 12)),
+                flags: payload.littleEndianUInt32(at: offset + 16)
+            )
+        }
+    }
+
     var monitorLayoutMonitorCount: UInt32? {
         guard pduType2 == 0x37, payload.count >= 4 else {
             return nil

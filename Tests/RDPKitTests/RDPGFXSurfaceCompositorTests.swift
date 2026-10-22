@@ -2,6 +2,32 @@ import Foundation
 @testable import RDPKit
 import Testing
 
+@Test func compositorCarriesServerMonitorDefinitionsAndReplacesThemOnReset() throws {
+    let compositor = RDPGFXSurfaceCompositor(outputWidth: 4, outputHeight: 2)
+    let clearCodec = RDPClearCodecDecoder()
+    let monitors = [
+        RDPMonitorDefinition(left: -2, top: -1, right: -1, bottom: 0, flags: 0),
+        RDPMonitorDefinition(left: 0, top: -1, right: 1, bottom: 0, flags: 1),
+    ]
+    try compositor.process(try createSurfaceMessage(surfaceID: 1, width: 4, height: 2), clearCodec: clearCodec)
+    try compositor.process(try mapSurfaceToOutputMessage(surfaceID: 1, x: 0, y: 0), clearCodec: clearCodec)
+    for definitions in [monitors, [monitors[1]], []] {
+        try compositor.process(
+            try resetGraphicsMessage(width: 4, height: 2, monitors: definitions), clearCodec: clearCodec
+        )
+        try compositor.process(
+            try solidFillMessage(
+                surfaceID: 1, color: [0, 0, 0, 255],
+                rects: [RDPGFXRect16(left: 0, top: 0, right: 4, bottom: 2)]
+            ), clearCodec: clearCodec
+        )
+        let frame = try #require(compositor.makeFrame(frameID: 1))
+        #expect(frame.monitorDefinitions == definitions)
+        #expect(frame.destinationRect == RDPFrameRect(left: 0, top: 0, right: 4, bottom: 2))
+        #expect(RDPFrameMetadata(frame).monitorDefinitions == definitions)
+    }
+}
+
 @Test func compositorCopiesSurfaceCacheEntriesBackToSurface() throws {
     let compositor = RDPGFXSurfaceCompositor()
     let clearCodec = RDPClearCodecDecoder()
@@ -1775,12 +1801,21 @@ private func deleteEncodingContextMessage(
     return try makeGraphicsMessage(commandID: RDPGFXCommandID.deleteEncodingContext, payload: payload)
 }
 
-private func resetGraphicsMessage(width: UInt32, height: UInt32) throws -> RDPGFXHeader {
+private func resetGraphicsMessage(
+    width: UInt32, height: UInt32, monitors: [RDPMonitorDefinition] = []
+) throws -> RDPGFXHeader {
     var payload = Data()
     payload.appendLittleEndianUInt32(width)
     payload.appendLittleEndianUInt32(height)
-    payload.appendLittleEndianUInt32(0)
-    payload.append(Data(repeating: 0, count: 320))
+    payload.appendLittleEndianUInt32(UInt32(monitors.count))
+    for monitor in monitors {
+        payload.appendLittleEndianUInt32(UInt32(bitPattern: monitor.left))
+        payload.appendLittleEndianUInt32(UInt32(bitPattern: monitor.top))
+        payload.appendLittleEndianUInt32(UInt32(bitPattern: monitor.right))
+        payload.appendLittleEndianUInt32(UInt32(bitPattern: monitor.bottom))
+        payload.appendLittleEndianUInt32(monitor.flags)
+    }
+    payload.append(Data(repeating: 0, count: 320 - monitors.count * 20))
     return try makeGraphicsMessage(commandID: RDPGFXCommandID.resetGraphics, payload: payload)
 }
 

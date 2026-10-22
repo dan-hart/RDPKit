@@ -35,6 +35,7 @@ final class RDPGFXSurfaceCompositor {
     private var cacheSlots: [UInt16: CacheEntry] = [:]
     private var codecContexts: Set<CodecContextKey> = []
     private var cachedByteCount = 0
+    var monitorDefinitions: [RDPMonitorDefinition] = []
     private var graphicsOutputRect: RDPFrameRect?
     private let maximumCacheByteCount: Int
     private let maximumCacheSlot: UInt16
@@ -193,6 +194,7 @@ final class RDPGFXSurfaceCompositor {
             codecName: "surface-bgra",
             pixelFormat: surface.pixelFormat,
             graphicsOutputRect: graphicsOutputRect,
+            monitorDefinitions: monitorDefinitions,
             surfaceRect: unscaledSurfaceRect,
             mappedOutputRect: mappedOutputRect,
             destinationRect: destinationRect,
@@ -250,6 +252,7 @@ final class RDPGFXSurfaceCompositor {
     }
 
     private func resetGraphics(_ pdu: RDPGFXResetGraphicsPDU) {
+        monitorDefinitions = pdu.monitorDefinitions
         graphicsOutputRect = RDPFrameRect(
             left: 0,
             top: 0,

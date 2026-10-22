@@ -3,6 +3,30 @@ import Foundation
 @testable import RDPKit
 import Testing
 
+@Test func decodedVideoCompositorPreservesMonitorDefinitionsAcrossPresentationPaths() throws {
+    let monitors = [RDPMonitorDefinition(left: -2, top: 0, right: 1, bottom: 1, flags: 1)]
+    let outputRect = RDPFrameRect(left: 0, top: 0, right: 4, bottom: 2)
+    for hasOutput in [false, true] {
+        let compositor = RDPDecodedVideoSurfaceCompositor()
+        for isPartial in [false, true] {
+            let updateRect = isPartial ? RDPFrameRect(left: 0, top: 0, right: 2, bottom: 2) : outputRect
+            var frame = videoFrame(
+                id: isPartial ? 2 : 1, graphicsOutputRect: hasOutput ? outputRect : nil,
+                surfaceRect: outputRect, destinationRect: updateRect, regionRects: [updateRect]
+            )
+            frame.monitorDefinitions = monitors
+            let presentation = try compositor.presentation(
+                for: frame,
+                decodedImageBuffer: try bgraPixelBuffer(
+                    width: Int(updateRect.width), height: 2, pixel: [0, 0, 0, 255]
+                )
+            )
+            #expect(presentation.frame.monitorDefinitions == monitors)
+            #expect(RDPFrameMetadata(presentation.frame).monitorDefinitions == monitors)
+        }
+    }
+}
+
 @Test func decodedVideoCompositorBlitsPartialUpdatesIntoPersistentSurface() throws {
     let compositor = RDPDecodedVideoSurfaceCompositor()
     let firstPresentation = try compositor.presentation(

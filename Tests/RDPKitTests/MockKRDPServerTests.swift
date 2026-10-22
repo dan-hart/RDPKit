@@ -715,6 +715,36 @@ struct MockKRDPServerTests {
     #expect(report.error == nil)
 }
 
+@Test func preflightCarriesLegacyMonitorLayoutThroughGraphicsHandshakeAndLiveUpdates() throws {
+    for behavior: MockKRDPGraphicsBehavior in [
+        .sendMonitorLayoutDuringGraphicsHandshake, .sendMonitorLayoutAfterGraphicsReset,
+    ] {
+        let server = try MockKRDPServer.start(graphicsBehavior: behavior)
+        defer { server.stop() }
+        let observed = MockKRDPObservedEvents()
+        let report = RDPPreflightClient().run(
+            configuration: RDPConnectionConfiguration(
+                host: "127.0.0.1", port: server.port,
+                credentials: RDPCredentials(username: "rdp-user", password: "secret"),
+                timeoutSeconds: 5, hideCertificateWarnings: true,
+                graphicsFrameCaptureLimit: 1, desktopWidth: 1280, desktopHeight: 720,
+                clipboardEnabled: false
+            ),
+            onGraphicsFrame: { observed.record($0) }
+        )
+        let expected = behavior == .sendMonitorLayoutDuringGraphicsHandshake ? [
+            RDPMonitorDefinition(left: 0, top: 0, right: 1279, bottom: 719, flags: 1),
+        ] : [
+            RDPMonitorDefinition(left: -640, top: 0, right: -1, bottom: 719, flags: 0),
+            RDPMonitorDefinition(left: 0, top: 0, right: 639, bottom: 719, flags: 1),
+        ]
+        #expect(report.status == "success")
+        #expect(report.rdpGraphicsFirstFrame?.monitorDefinitions == expected)
+        #expect(observed.frames.first?.monitorDefinitions == expected)
+        #expect(report.error == nil)
+    }
+}
+
 @Test func preflightContinuesWhenMonitorLayoutArrivesBeforeServerSynchronize() throws {
     let server = try MockKRDPServer.start(licensingBehavior: .validClientThenDemandActiveWithMonitorLayout)
     defer { server.stop() }
@@ -738,6 +768,9 @@ struct MockKRDPServerTests {
     #expect(report.rdpFinalizationResponseTypes?.contains("control-granted-control") == true)
     #expect(report.rdpFinalizationResponseTypes?.contains("font-map") == true)
     #expect(report.rdpGraphicsFirstFrame?.codecName == "avc420")
+    #expect(report.rdpGraphicsFirstFrame?.monitorDefinitions == [
+        RDPMonitorDefinition(left: 0, top: 0, right: 1279, bottom: 719, flags: 1),
+    ])
     #expect(report.error == nil)
 }
 

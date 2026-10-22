@@ -259,6 +259,33 @@ import Testing
     #expect(pdu.errorInfo == 0x0000_0009)
 }
 
+@Test func shareDataParsesSignedMultipleMonitorDefinitions() throws {
+    let monitors = [
+        RDPMonitorDefinition(left: -1920, top: -200, right: -1, bottom: 879, flags: 0),
+        RDPMonitorDefinition(left: 0, top: 0, right: 1919, bottom: 1079, flags: 1),
+    ]
+    var payload = Data()
+    payload.appendLittleEndianUInt32(UInt32(monitors.count))
+    for monitor in monitors {
+        for coordinate in [monitor.left, monitor.top, monitor.right, monitor.bottom] {
+            payload.appendLittleEndianUInt32(UInt32(bitPattern: coordinate))
+        }
+        payload.appendLittleEndianUInt32(monitor.flags)
+    }
+    let pdu = try #require(try RDPShareDataPDU.parseIfPresent(fromTPKT: shareDataPacket(
+        type: 0x37, pduSource: 0, payload: payload
+    )))
+    #expect(pdu.monitorLayoutDefinitions == monitors)
+
+    for malformed in [Data(payload.dropLast()), Data(payload.prefix(24)), payload + Data([0])] {
+        #expect(throws: RDPDecodeError.invalidShareDataHeader) {
+            try RDPShareDataPDU.parseIfPresent(fromTPKT: shareDataPacket(
+                type: 0x37, pduSource: 0, payload: malformed
+            ))
+        }
+    }
+}
+
 @Test func shareDataParsesMonitorLayoutPDU() throws {
     var payload = Data()
     payload.appendLittleEndianUInt32(1)
@@ -276,6 +303,9 @@ import Testing
 
     #expect(pdu.typeName == "monitor-layout")
     #expect(pdu.monitorLayoutMonitorCount == 1)
+    #expect(pdu.monitorLayoutDefinitions == [
+        RDPMonitorDefinition(left: 0, top: 0, right: 1919, bottom: 1079, flags: 1),
+    ])
 }
 
 @Test func shareDataParsesAutoReconnectStatusPDU() throws {

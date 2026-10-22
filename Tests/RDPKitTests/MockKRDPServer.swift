@@ -116,6 +116,8 @@ enum MockKRDPSecurityProtocol {
 
 enum MockKRDPGraphicsBehavior: Equatable {
     case sendFirstFrame
+    case sendMonitorLayoutDuringGraphicsHandshake
+    case sendMonitorLayoutAfterGraphicsReset
     case sendPointerUpdatesBeforeFirstFrame
     case sendCompressedCapsConfirmFirstFrame
     case sendFragmentedCompressedCapsConfirmFirstFrame
@@ -1463,6 +1465,9 @@ private final class MockKRDPServerHandler: ChannelInboundHandler {
                 try RDPGFXCapsAdvertisePDU.parseIfPresent(from: $0.payload)
             }
             let selectedCapability = graphicsCapabilitySelection.selectedCapability(from: advertise)
+            if graphicsBehavior == .sendMonitorLayoutDuringGraphicsHandshake {
+                writePacket(MockKRDPFixtures.monitorLayout(), context: context)
+            }
             if graphicsBehavior == .sendCompressedCapsConfirmFirstFrame {
                 writePacket(
                     MockKRDPFixtures.compressedGraphicsCapsConfirmFirst(capability: selectedCapability),
@@ -1498,6 +1503,8 @@ private final class MockKRDPServerHandler: ChannelInboundHandler {
             }
             switch graphicsBehavior {
             case .sendFirstFrame,
+                 .sendMonitorLayoutDuringGraphicsHandshake,
+                 .sendMonitorLayoutAfterGraphicsReset,
                  .sendPointerUpdatesBeforeFirstFrame,
                  .sendCompressedCapsConfirmFirstFrame,
                  .sendFragmentedCompressedCapsConfirmFirstFrame,
@@ -2314,15 +2321,35 @@ private enum MockKRDPFixtures {
         return shareDataPacket(pduType2: 0x1F, payload: payload)
     }
 
-    static func monitorLayout() -> Data {
+    static func monitorLayout(monitors: [RDPMonitorDefinition] = [
+        RDPMonitorDefinition(left: 0, top: 0, right: 1279, bottom: 719, flags: 1),
+    ]) -> Data {
         var payload = Data()
-        payload.appendLittleEndianUInt32(1)
-        payload.appendLittleEndianUInt32(0)
-        payload.appendLittleEndianUInt32(0)
-        payload.appendLittleEndianUInt32(1279)
-        payload.appendLittleEndianUInt32(719)
-        payload.appendLittleEndianUInt32(0x0000_0001)
+        payload.appendLittleEndianUInt32(UInt32(monitors.count))
+        for monitor in monitors {
+            appendMonitor(monitor, to: &payload)
+        }
         return shareDataPacket(pduType2: 0x37, payload: payload, pduSource: 0)
+    }
+
+    static func resetGraphicsMessage() -> Data {
+        var payload = Data()
+        payload.appendLittleEndianUInt32(1280)
+        payload.appendLittleEndianUInt32(720)
+        payload.appendLittleEndianUInt32(1)
+        appendMonitor(
+            RDPMonitorDefinition(left: 0, top: 0, right: 1279, bottom: 719, flags: 1), to: &payload
+        )
+        payload.append(Data(repeating: 0, count: 300))
+        return graphicsMessage(commandID: RDPGFXCommandID.resetGraphics, payload: payload)
+    }
+
+    private static func appendMonitor(_ monitor: RDPMonitorDefinition, to payload: inout Data) {
+        payload.appendLittleEndianUInt32(UInt32(bitPattern: monitor.left))
+        payload.appendLittleEndianUInt32(UInt32(bitPattern: monitor.top))
+        payload.appendLittleEndianUInt32(UInt32(bitPattern: monitor.right))
+        payload.appendLittleEndianUInt32(UInt32(bitPattern: monitor.bottom))
+        payload.appendLittleEndianUInt32(monitor.flags)
     }
 
     static func saveSessionInfo() -> Data {
@@ -2626,10 +2653,20 @@ private enum MockKRDPFixtures {
     static func graphicsFrameUpdatePackets(behavior: MockKRDPGraphicsBehavior) -> [Data] {
         switch behavior {
         case .sendFirstFrame,
+             .sendMonitorLayoutDuringGraphicsHandshake,
              .sendCompressedCapsConfirmFirstFrame,
              .sendFragmentedCompressedCapsConfirmFirstFrame,
              .closeAfterFirstFrame:
             [graphicsDynamicPacket(avc420FrameMessages())]
+        case .sendMonitorLayoutAfterGraphicsReset:
+            [
+                graphicsDynamicPacket(resetGraphicsMessage()),
+                monitorLayout(monitors: [
+                    RDPMonitorDefinition(left: -640, top: 0, right: -1, bottom: 719, flags: 0),
+                    RDPMonitorDefinition(left: 0, top: 0, right: 639, bottom: 719, flags: 1),
+                ]),
+                graphicsDynamicPacket(avc420FrameMessages()),
+            ]
         case .sendPointerUpdatesBeforeFirstFrame:
             [pointerColorUpdate(), cachedPointerUpdate(), graphicsDynamicPacket(avc420FrameMessages())]
         case .setErrorInfoLogoffBeforeFrame:

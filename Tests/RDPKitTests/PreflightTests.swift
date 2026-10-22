@@ -376,6 +376,23 @@ import Testing
     #expect(frame.h264NalUnitTypes == [])
 }
 
+@Test func copiedVideoFramesPreserveMonitorDefinitions() throws {
+    let monitors = [RDPMonitorDefinition(left: -2, top: 0, right: 1, bottom: 1, flags: 1)]
+    let frame = RDPGraphicsFrameSnapshot(
+        frameID: 1, surfaceID: 1, codecID: RDPGFXCodecID.avc420, codecName: "avc420", pixelFormat: 32,
+        monitorDefinitions: monitors,
+        destinationRect: RDPFrameRect(left: 0, top: 0, right: 2, bottom: 2),
+        regionRects: [], encodedVideoData: Data([0, 0, 1, 0x65])
+    )
+    let copy = RDPGFXSurfaceToSurfacePDU(
+        sourceSurfaceID: 1, destinationSurfaceID: 2,
+        sourceRect: RDPGFXRect16(left: 0, top: 0, right: 2, bottom: 2),
+        destinationPoints: [RDPGFXPoint16(x: 2, y: 0)]
+    )
+    let copied = try #require(copiedVideoFrames([frame], using: copy).first)
+    #expect(copied.monitorDefinitions == monitors)
+}
+
 @Test func copiedVideoFramesRejectsDestinationsOutsideCoordinateRange() {
     let frame = RDPGraphicsFrameSnapshot(
         frameID: 9,

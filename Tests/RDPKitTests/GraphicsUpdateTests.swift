@@ -340,6 +340,8 @@ private func compressedBitmapHeader(
 
 @Test func primarySurfaceCompositorEmitsRawSurfaceCommandFrame() throws {
     let compositor = RDPPrimarySurfaceCompositor(width: 4, height: 4)
+    let monitors = [RDPMonitorDefinition(left: 0, top: 0, right: 3, bottom: 3, flags: 1)]
+    compositor.monitorDefinitions = monitors
     let pixelData = Data([
         0x01, 0x02, 0x03, 0xFF,
         0x04, 0x05, 0x06, 0xFF,
@@ -356,6 +358,7 @@ private func compressedBitmapHeader(
     let bitmap = try #require(frame.decodedBitmapData)
 
     #expect(frames.count == 1)
+    #expect(frame.monitorDefinitions == monitors)
     #expect(frame.frameID == 99)
     #expect(frame.codecName == "surface-bgra")
     #expect(frame.destinationRect == RDPFrameRect(left: 0, top: 0, right: 4, bottom: 4))

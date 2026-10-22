@@ -129,7 +129,32 @@ public struct RDPViewerPixelSize: Equatable, Sendable {
     }
 }
 
+/// A server-reported monitor rectangle from a monitor layout or graphics reset.
+///
+/// Coordinates are relative to the primary monitor's upper-left corner and may
+/// be negative. `right` and `bottom` are inclusive, unlike `RDPFrameRect`.
+/// To locate a monitor in the zero-based graphics output buffer, subtract the
+/// minimum `left` and `top` across the layout and add one to the inclusive bounds
+/// when computing its width and height. Encoded video destination rectangles can
+/// be surface-local; use the frame's output mapping before comparing them.
+public struct RDPMonitorDefinition: Codable, Equatable, Sendable {
+    public var left: Int32
+    public var top: Int32
+    public var right: Int32
+    public var bottom: Int32
+    public var flags: UInt32
+
+    public init(left: Int32, top: Int32, right: Int32, bottom: Int32, flags: UInt32) {
+        self.left = left
+        self.top = top
+        self.right = right
+        self.bottom = bottom
+        self.flags = flags
+    }
+}
+
 public struct RDPFrameMetadata: Equatable, Sendable {
+    public var monitorDefinitions: [RDPMonitorDefinition]
     public var frameID: UInt32?
     public var surfaceID: UInt16
     public var codecID: UInt16
@@ -149,6 +174,7 @@ public struct RDPFrameMetadata: Equatable, Sendable {
     }
 
     public init(_ frame: RDPGraphicsFrameSnapshot) {
+        monitorDefinitions = frame.monitorDefinitions
         frameID = frame.frameID
         surfaceID = frame.surfaceID
         codecID = frame.codecID

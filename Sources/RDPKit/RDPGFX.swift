@@ -1187,13 +1187,9 @@ struct RDPGFXAlphaBitmapStream: Equatable, Sendable {
     }
 }
 
-struct RDPGFXMonitorDefinition: Equatable, Sendable {
-    var left: Int32
-    var top: Int32
-    var right: Int32
-    var bottom: Int32
-    var flags: UInt32
+typealias RDPGFXMonitorDefinition = RDPMonitorDefinition
 
+extension RDPMonitorDefinition {
     static func parse(from cursor: inout ByteCursor) throws -> RDPGFXMonitorDefinition {
         RDPGFXMonitorDefinition(
             left: Int32(bitPattern: try cursor.readLittleEndianUInt32()),

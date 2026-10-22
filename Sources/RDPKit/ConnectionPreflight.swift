@@ -414,6 +414,8 @@ public struct RDPGraphicsFrameSnapshot: Encodable, Equatable, Sendable {
     public var codecName: String
     public var videoCodec: RDPVideoCodec
     public var pixelFormat: UInt8
+    /// The server's latest monitor layout, or empty when no layout was reported.
+    public var monitorDefinitions: [RDPMonitorDefinition]
     public var graphicsOutputRect: RDPFrameRect?
     public var surfaceRect: RDPFrameRect?
     public var mappedOutputRect: RDPFrameRect?
@@ -435,6 +437,7 @@ public struct RDPGraphicsFrameSnapshot: Encodable, Equatable, Sendable {
         videoCodec: RDPVideoCodec = .h264,
         pixelFormat: UInt8,
         graphicsOutputRect: RDPFrameRect? = nil,
+        monitorDefinitions: [RDPMonitorDefinition] = [],
         surfaceRect: RDPFrameRect? = nil,
         mappedOutputRect: RDPFrameRect? = nil,
         destinationRect: RDPFrameRect,
@@ -449,6 +452,7 @@ public struct RDPGraphicsFrameSnapshot: Encodable, Equatable, Sendable {
             videoCodec: videoCodec,
             pixelFormat: pixelFormat,
             graphicsOutputRect: graphicsOutputRect,
+            monitorDefinitions: monitorDefinitions,
             surfaceRect: surfaceRect,
             mappedOutputRect: mappedOutputRect,
             destinationRect: destinationRect,
@@ -465,6 +469,7 @@ public struct RDPGraphicsFrameSnapshot: Encodable, Equatable, Sendable {
         videoCodec: RDPVideoCodec = .h264,
         pixelFormat: UInt8,
         graphicsOutputRect: RDPFrameRect? = nil,
+        monitorDefinitions: [RDPMonitorDefinition] = [],
         surfaceRect: RDPFrameRect? = nil,
         mappedOutputRect: RDPFrameRect? = nil,
         destinationRect: RDPGFXRect16,
@@ -479,6 +484,7 @@ public struct RDPGraphicsFrameSnapshot: Encodable, Equatable, Sendable {
             videoCodec: videoCodec,
             pixelFormat: pixelFormat,
             graphicsOutputRect: graphicsOutputRect,
+            monitorDefinitions: monitorDefinitions,
             surfaceRect: surfaceRect,
             mappedOutputRect: mappedOutputRect,
             destinationRect: RDPFrameRect(destinationRect),
@@ -495,6 +501,7 @@ public struct RDPGraphicsFrameSnapshot: Encodable, Equatable, Sendable {
         videoCodec: RDPVideoCodec = .h264,
         pixelFormat: UInt8,
         graphicsOutputRect: RDPFrameRect? = nil,
+        monitorDefinitions: [RDPMonitorDefinition] = [],
         surfaceRect: RDPFrameRect? = nil,
         mappedOutputRect: RDPFrameRect? = nil,
         destinationRect: RDPFrameRect,
@@ -514,6 +521,7 @@ public struct RDPGraphicsFrameSnapshot: Encodable, Equatable, Sendable {
         self.videoCodec = videoCodec
         self.pixelFormat = pixelFormat
         self.graphicsOutputRect = graphicsOutputRect
+        self.monitorDefinitions = monitorDefinitions
         self.surfaceRect = surfaceRect
         self.mappedOutputRect = mappedOutputRect
         self.destinationRect = destinationRect
@@ -535,6 +543,7 @@ public struct RDPGraphicsFrameSnapshot: Encodable, Equatable, Sendable {
         videoCodec: RDPVideoCodec = .h264,
         pixelFormat: UInt8,
         graphicsOutputRect: RDPFrameRect? = nil,
+        monitorDefinitions: [RDPMonitorDefinition] = [],
         surfaceRect: RDPFrameRect? = nil,
         mappedOutputRect: RDPFrameRect? = nil,
         destinationRect: RDPGFXRect16,
@@ -549,6 +558,7 @@ public struct RDPGraphicsFrameSnapshot: Encodable, Equatable, Sendable {
             videoCodec: videoCodec,
             pixelFormat: pixelFormat,
             graphicsOutputRect: graphicsOutputRect,
+            monitorDefinitions: monitorDefinitions,
             surfaceRect: surfaceRect,
             mappedOutputRect: mappedOutputRect,
             destinationRect: RDPFrameRect(destinationRect),
@@ -613,6 +623,7 @@ public struct RDPGraphicsFrameSnapshot: Encodable, Equatable, Sendable {
         case videoCodecName
         case pixelFormat
         case graphicsOutputRect
+        case monitorDefinitions
         case surfaceRect
         case mappedOutputRect
         case destinationRect
@@ -636,6 +647,7 @@ public struct RDPGraphicsFrameSnapshot: Encodable, Equatable, Sendable {
         try container.encode(videoCodec.displayName, forKey: .videoCodecName)
         try container.encode(pixelFormat, forKey: .pixelFormat)
         try container.encodeIfPresent(graphicsOutputRect, forKey: .graphicsOutputRect)
+        try container.encode(monitorDefinitions, forKey: .monitorDefinitions)
         try container.encodeIfPresent(surfaceRect, forKey: .surfaceRect)
         try container.encodeIfPresent(mappedOutputRect, forKey: .mappedOutputRect)
         try container.encode(destinationRect, forKey: .destinationRect)
@@ -1867,6 +1879,7 @@ private struct RDPConnectionFinalizationResult {
 }
 
 private struct RDPGraphicsDynamicChannelResult {
+    var monitorDefinitions: [RDPMonitorDefinition] = []
     var dynamicChannelRequestData: [Data] = []
     var dynamicChannelRequestTypes: [String] = []
     var dynamicChannelCapabilitiesRequest: RDPDynamicVirtualChannelCapabilitiesRequest? = nil
@@ -3842,6 +3855,8 @@ private func performMCSConnectionSequence(
                             graphicsResult = performRDPGraphicsDynamicChannelHandshake(
                                 desktopWidth: configuration.desktopWidth,
                                 desktopHeight: configuration.desktopHeight,
+                                monitorDefinitions: finalizationResult.responses.compactMap(\.monitorLayoutDefinitions)
+                                    .last ?? [],
                                 shareID: demandActive.shareID,
                                 userChannelID: userChannelID,
                                 ioChannelID: ioChannelID,
@@ -4293,6 +4308,7 @@ private func performRDPConnectionFinalization(
 private func performRDPGraphicsDynamicChannelHandshake(
     desktopWidth: UInt16,
     desktopHeight: UInt16,
+    monitorDefinitions: [RDPMonitorDefinition],
     shareID: UInt32,
     userChannelID: UInt16,
     ioChannelID: UInt16,
@@ -4319,6 +4335,7 @@ private func performRDPGraphicsDynamicChannelHandshake(
     shouldCancel: RDPCancellationHandler?
 ) -> RDPGraphicsDynamicChannelResult {
     var result = RDPGraphicsDynamicChannelResult()
+    result.monitorDefinitions = monitorDefinitions
     let graphicsTransport = RDPGFXServerTransportDecoder()
     var dynamicAudioSession: RDPAudioSession?
     var dynamicChannelDecompressors: [UInt32: RDPZGFXDecompressor] = [:]
@@ -4339,6 +4356,10 @@ private func performRDPGraphicsDynamicChannelHandshake(
                 channelID: staticChannelID,
                 maximumChunkByteCount: maximumStaticVirtualChannelChunkSize
             ) else {
+                if let definitions = try RDPShareDataPDU.parseIfPresent(fromTPKT: packet)?.monitorLayoutDefinitions {
+                    result.monitorDefinitions = definitions
+                    continue
+                }
                 if let shareData = try RDPShareDataPDU.parseIfPresent(fromTPKT: packet),
                    let errorInfo = shareData.errorInfo
                 {
@@ -5615,13 +5636,15 @@ private func receiveRDPGraphicsUpdateBatch(
         outputHeight: desktopHeight
     )
     let primarySurfaceCompositor = RDPPrimarySurfaceCompositor(width: desktopWidth, height: desktopHeight)
+    surfaceCompositor.monitorDefinitions = result.monitorDefinitions
+    primarySurfaceCompositor.monitorDefinitions = result.monitorDefinitions
     let remotePointerState = RDPRemotePointerState()
     let targetFrameCount = frameCaptureLimit.map { max(1, $0) }
     let packetLimit = targetFrameCount.map { max(256, 256 * $0) }
 
     func processGraphicsPayload(_ payload: Data, packet: Data) throws -> Bool {
         recordRDPGraphicsUpdatePacket(packet, result: &result)
-        return try processRDPGraphicsUpdatePayload(
+        let isComplete = try processRDPGraphicsUpdatePayload(
             payload,
             dynamicChannelID: dynamicChannelID,
             staticChannelID: staticChannelID,
@@ -5636,6 +5659,9 @@ private func receiveRDPGraphicsUpdateBatch(
             clearCodec: clearCodec,
             surfaceCompositor: surfaceCompositor
         )
+        result.monitorDefinitions = surfaceCompositor.monitorDefinitions
+        primarySurfaceCompositor.monitorDefinitions = surfaceCompositor.monitorDefinitions
+        return isComplete
     }
 
     func handleDynamicChannelDataFirst(
@@ -5811,6 +5837,12 @@ private func receiveRDPGraphicsUpdateBatch(
             channelID: staticChannelID,
             maximumChunkByteCount: maximumStaticVirtualChannelChunkSize
         ) else {
+            if let definitions = try RDPShareDataPDU.parseIfPresent(fromTPKT: packet)?.monitorLayoutDefinitions {
+                result.monitorDefinitions = definitions
+                surfaceCompositor.monitorDefinitions = definitions
+                primarySurfaceCompositor.monitorDefinitions = definitions
+                continue
+            }
             if let shareData = try RDPShareDataPDU.parseIfPresent(fromTPKT: packet),
                let errorInfo = shareData.errorInfo
             {
@@ -6260,6 +6292,7 @@ private func processRDPGraphicsUpdatePayload(
                         videoCodec: .h264,
                         pixelFormat: wire.pixelFormat,
                         graphicsOutputRect: surfaceCompositor.outputRect(),
+                        monitorDefinitions: surfaceCompositor.monitorDefinitions,
                         surfaceRect: surfaceCompositor.surfaceRect(surfaceID: wire.surfaceID),
                         mappedOutputRect: surfaceCompositor.mappedOutputRect(surfaceID: wire.surfaceID),
                         destinationRect: wire.destinationRect,
@@ -6290,6 +6323,7 @@ private func processRDPGraphicsUpdatePayload(
                         videoCodec: .h264,
                         pixelFormat: wire.pixelFormat,
                         graphicsOutputRect: surfaceCompositor.outputRect(),
+                        monitorDefinitions: surfaceCompositor.monitorDefinitions,
                         surfaceRect: surfaceCompositor.surfaceRect(surfaceID: wire.surfaceID),
                         mappedOutputRect: surfaceCompositor.mappedOutputRect(surfaceID: wire.surfaceID),
                         destinationRect: RDPFrameRect(wire.destinationRect),
@@ -6322,6 +6356,7 @@ private func processRDPGraphicsUpdatePayload(
                     }
                     var mappedFrame = frame
                     mappedFrame.graphicsOutputRect = surfaceCompositor.outputRect()
+                    mappedFrame.monitorDefinitions = surfaceCompositor.monitorDefinitions
                     mappedFrame.surfaceRect = surfaceRect
                     mappedFrame.mappedOutputRect = surfaceCompositor.mappedOutputRect(surfaceID: frame.surfaceID)
                     return mappedFrame

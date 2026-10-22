@@ -1,6 +1,7 @@
 import Foundation
 
 final class RDPPrimarySurfaceCompositor {
+    var monitorDefinitions: [RDPMonitorDefinition] = []
     private let width: Int
     private let height: Int
     private let bytesPerRow: Int
@@ -422,6 +423,7 @@ final class RDPPrimarySurfaceCompositor {
             codecID: 0,
             codecName: "surface-bgra",
             pixelFormat: 0x20,
+            monitorDefinitions: monitorDefinitions,
             destinationRect: destinationRect,
             regionRects: dirtyRects,
             encodedVideoData: Data(),
