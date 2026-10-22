@@ -4962,6 +4962,7 @@ private func handleInitialGraphicsPayload(
         dynamicChannelDecompressors: dynamicChannelDecompressors,
         dynamicChannelNegotiatedVersion: dynamicChannelNegotiatedVersion,
         graphicsCapabilitySet: capsConfirm.capabilitySet,
+        initialGraphicsUpdate: (payload: payload, packet: packet, messages: Array(graphicsMessages.dropFirst())),
         result: &result
     )
     return true
@@ -5617,6 +5618,7 @@ private func receiveRDPGraphicsUpdateBatch(
     dynamicChannelDecompressors initialDynamicChannelDecompressors: [UInt32: RDPZGFXDecompressor],
     dynamicChannelNegotiatedVersion: UInt16?,
     graphicsCapabilitySet: RDPGFXCapabilitySet,
+    initialGraphicsUpdate: (payload: Data, packet: Data, messages: [RDPGFXHeader]),
     result: inout RDPGraphicsDynamicChannelResult
 ) throws {
     var totalFramesDecoded: UInt32 = 0
@@ -5642,7 +5644,9 @@ private func receiveRDPGraphicsUpdateBatch(
     let targetFrameCount = frameCaptureLimit.map { max(1, $0) }
     let packetLimit = targetFrameCount.map { max(256, 256 * $0) }
 
-    func processGraphicsPayload(_ payload: Data, packet: Data) throws -> Bool {
+    func processGraphicsPayload(
+        _ payload: Data, packet: Data, decodedMessages: [RDPGFXHeader]? = nil
+    ) throws -> Bool {
         recordRDPGraphicsUpdatePacket(packet, result: &result)
         let isComplete = try processRDPGraphicsUpdatePayload(
             payload,
@@ -5657,7 +5661,10 @@ private func receiveRDPGraphicsUpdateBatch(
             onGraphicsFrame: onGraphicsFrame,
             graphicsTransport: graphicsTransport,
             clearCodec: clearCodec,
-            surfaceCompositor: surfaceCompositor
+            surfaceCompositor: surfaceCompositor,
+            decodedMessages: decodedMessages,
+            cancellation: cancellation,
+            shouldCancel: shouldCancel
         )
         result.monitorDefinitions = surfaceCompositor.monitorDefinitions
         primarySurfaceCompositor.monitorDefinitions = surfaceCompositor.monitorDefinitions
@@ -5792,6 +5799,19 @@ private func receiveRDPGraphicsUpdateBatch(
             return false
         }
         return try processGraphicsPayload(dataPDU.payload, packet: packet)
+    }
+
+    // CapsConfirm may share a transport payload with reset, surface, and frame
+    // messages. The transport decoder has already consumed that payload, so
+    // process its remaining decoded messages before receiving another packet.
+    if !initialGraphicsUpdate.messages.isEmpty,
+       try processGraphicsPayload(
+           initialGraphicsUpdate.payload,
+           packet: initialGraphicsUpdate.packet,
+           decodedMessages: initialGraphicsUpdate.messages
+       )
+    {
+        return
     }
 
     var packetsRead = 0
@@ -6237,11 +6257,15 @@ private func processRDPGraphicsUpdatePayload(
     onGraphicsFrame: RDPGraphicsFrameHandler?,
     graphicsTransport: RDPGFXServerTransportDecoder,
     clearCodec: RDPClearCodecDecoder,
-    surfaceCompositor: RDPGFXSurfaceCompositor
+    surfaceCompositor: RDPGFXSurfaceCompositor,
+    decodedMessages: [RDPGFXHeader]? = nil,
+    cancellation: RDPConnectionCancellation?,
+    shouldCancel: RDPCancellationHandler?
 ) throws -> Bool {
+    try throwIfCancelled(shouldCancel, cancellation: cancellation)
     let graphicsMessages: [RDPGFXHeader]
     do {
-        graphicsMessages = try graphicsTransport.decodeGraphicsMessages(from: payload)
+        graphicsMessages = try decodedMessages ?? graphicsTransport.decodeGraphicsMessages(from: payload)
     } catch {
         recordRDPGraphicsFailure(
             payload: payload,
@@ -6264,6 +6288,7 @@ private func processRDPGraphicsUpdatePayload(
     var messageIndex: Int?
     do {
         for (index, message) in graphicsMessages.enumerated() {
+            try throwIfCancelled(shouldCancel, cancellation: cancellation)
             messageIndex = index
             guard try logicalFrameTracker.shouldProcess(message) else {
                 continue
@@ -6376,8 +6401,12 @@ private func processRDPGraphicsUpdatePayload(
                 let framesToEmit = result.pendingGraphicsFrames
                 result.pendingGraphicsFrames.removeAll()
                 for frame in framesToEmit {
+                    try throwIfCancelled(shouldCancel, cancellation: cancellation)
                     try onGraphicsFrame?(frame)
                 }
+                // A frame handler may cancel after accepting a frame. Do not
+                // acknowledge or process more of the payload after cancellation.
+                try throwIfCancelled(shouldCancel, cancellation: cancellation)
                 totalFramesDecoded += 1
                 let acknowledgePayload = RDPGFXFrameAcknowledgePDU(
                     frameID: endFrame.frameID,
@@ -6396,10 +6425,9 @@ private func processRDPGraphicsUpdatePayload(
                     result.graphicsFrameAcknowledgeData.append(acknowledgePacket)
                 }
                 try sendApplicationPacket(acknowledgePacket, on: channel)
-                guard let targetFrameCount else {
-                    return false
+                if let targetFrameCount, totalFramesDecoded >= UInt32(targetFrameCount) {
+                    return true
                 }
-                return totalFramesDecoded >= UInt32(targetFrameCount)
             }
         }
     } catch {

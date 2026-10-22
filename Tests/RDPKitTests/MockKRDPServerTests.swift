@@ -715,6 +715,119 @@ struct MockKRDPServerTests {
     #expect(report.error == nil)
 }
 
+@Test func preflightPreservesCoalescedGraphicsFramesAndLayouts() throws {
+    for behavior: MockKRDPGraphicsBehavior in [
+        .sendCoalescedFrames, .sendCoalescedCapsAndFrames, .sendCoalescedSegmentedCapsAndFrames,
+    ] {
+        for limit: Int? in [nil, 1, 2, 3] {
+            let server = try MockKRDPServer.start(graphicsBehavior: behavior)
+            defer { server.stop() }
+            let observed = MockKRDPObservedEvents()
+            let report = RDPPreflightClient().run(
+                configuration: RDPConnectionConfiguration(
+                    host: "127.0.0.1", port: server.port,
+                    credentials: RDPCredentials(username: "rdp-user", password: "secret"),
+                    timeoutSeconds: 1, hideCertificateWarnings: true,
+                    graphicsFrameCaptureLimit: limit, desktopWidth: 1280, desktopHeight: 720,
+                    clipboardEnabled: false
+                ),
+                onGraphicsFrame: { observed.record($0) }
+            )
+            let expectedCount = limit ?? 3
+            #expect(report.status == "success")
+            #expect(report.error == nil)
+            #expect(observed.frames.map(\.frameID) == (1 ... expectedCount).map { UInt32($0) })
+            #expect(observed.frames.map { $0.monitorDefinitions.count } == Array([1, 2, 2].prefix(expectedCount)))
+            let acknowledgements = report.rdpGraphicsFrameAcknowledgeHexes ?? []
+            #expect(acknowledgements.count == expectedCount)
+            for (index, hex) in acknowledgements.enumerated() {
+                let expected = RDPGFXFrameAcknowledgePDU(
+                    frameID: UInt32(index + 1), totalFramesDecoded: UInt32(index + 1)
+                ).encoded().rdpHexString
+                #expect(hex.hasSuffix(expected))
+            }
+        }
+    }
+}
+
+@Test func preflightCancelsBetweenCoalescedGraphicsFrames() throws {
+    for behavior: MockKRDPGraphicsBehavior in [.sendCoalescedFrames, .sendCoalescedCapsAndFrames] {
+        for usesCancellationToken in [false, true] {
+            let server = try MockKRDPServer.start(graphicsBehavior: behavior)
+            defer { server.stop() }
+            let signal = RDPConnectionCancellation()
+            let observed = MockKRDPObservedEvents()
+            let shouldCancel: RDPCancellationHandler? = usesCancellationToken ? nil : { @Sendable in signal.isCancelled }
+            let report = RDPPreflightClient().run(
+                configuration: RDPConnectionConfiguration(
+                    host: "127.0.0.1", port: server.port,
+                    credentials: RDPCredentials(username: "rdp-user", password: "secret"),
+                    timeoutSeconds: 1, hideCertificateWarnings: true,
+                    graphicsFrameCaptureLimit: nil, desktopWidth: 1280, desktopHeight: 720,
+                    clipboardEnabled: false
+                ),
+                onGraphicsFrame: { frame in
+                    observed.record(frame)
+                    if frame.frameID == 1 { signal.cancel() }
+                },
+                cancellation: usesCancellationToken ? signal : nil,
+                shouldCancel: shouldCancel
+            )
+            #expect(observed.frames.map(\.frameID) == [1])
+            #expect(report.rdpGraphicsFrameAcknowledgeHexes == [])
+            #expect(report.error == "cancelled")
+        }
+    }
+}
+
+@Test func preflightHonorsReadyCallbackCancellationBeforeCoalescedCapsFrames() throws {
+    let server = try MockKRDPServer.start(graphicsBehavior: .sendCoalescedCapsAndFrames)
+    defer { server.stop() }
+    let signal = RDPConnectionCancellation()
+    let observed = MockKRDPObservedEvents()
+    let report = RDPPreflightClient().run(
+        configuration: RDPConnectionConfiguration(
+            host: "127.0.0.1", port: server.port,
+            credentials: RDPCredentials(username: "rdp-user", password: "secret"),
+            timeoutSeconds: 1, hideCertificateWarnings: true,
+            graphicsFrameCaptureLimit: nil, desktopWidth: 1280, desktopHeight: 720,
+            clipboardEnabled: false
+        ),
+        onGraphicsFrame: { observed.record($0) },
+        onInputReady: { _ in signal.cancel() },
+        shouldCancel: { signal.isCancelled }
+    )
+    #expect(observed.frames.isEmpty)
+    #expect(report.rdpGraphicsFrameAcknowledgeHexes == [])
+    #expect(report.error == "cancelled")
+}
+
+@Test func preflightStopsCoalescedFramesBeforeAcknowledgingFailedHandler() throws {
+    let server = try MockKRDPServer.start(graphicsBehavior: .sendCoalescedCapsAndFrames)
+    defer { server.stop() }
+    let observed = MockKRDPObservedEvents()
+    let report = RDPPreflightClient().run(
+        configuration: RDPConnectionConfiguration(
+            host: "127.0.0.1", port: server.port,
+            credentials: RDPCredentials(username: "rdp-user", password: "secret"),
+            timeoutSeconds: 1, hideCertificateWarnings: true,
+            graphicsFrameCaptureLimit: nil, desktopWidth: 1280, desktopHeight: 720,
+            clipboardEnabled: false
+        ),
+        onGraphicsFrame: { frame in
+            observed.record(frame)
+            if frame.frameID == 2 { throw MockGraphicsFrameHandlerError.failed }
+        }
+    )
+    #expect(report.status == "failure")
+    #expect(observed.frames.map(\.frameID) == [1, 2])
+    #expect(report.rdpGraphicsFrameAcknowledgeHexes?.count == 1)
+    #expect(report.rdpGraphicsFrameAcknowledgeHexes?.first?.hasSuffix(
+        RDPGFXFrameAcknowledgePDU(frameID: 1, totalFramesDecoded: 1).encoded().rdpHexString
+    ) == true)
+    #expect(report.error?.contains("mock graphics frame handler failed") == true)
+}
+
 @Test func preflightCarriesLegacyMonitorLayoutThroughGraphicsHandshakeAndLiveUpdates() throws {
     for behavior: MockKRDPGraphicsBehavior in [
         .sendMonitorLayoutDuringGraphicsHandshake, .sendMonitorLayoutAfterGraphicsReset,

@@ -116,6 +116,9 @@ enum MockKRDPSecurityProtocol {
 
 enum MockKRDPGraphicsBehavior: Equatable {
     case sendFirstFrame
+    case sendCoalescedFrames
+    case sendCoalescedCapsAndFrames
+    case sendCoalescedSegmentedCapsAndFrames
     case sendMonitorLayoutDuringGraphicsHandshake
     case sendMonitorLayoutAfterGraphicsReset
     case sendPointerUpdatesBeforeFirstFrame
@@ -1468,7 +1471,16 @@ private final class MockKRDPServerHandler: ChannelInboundHandler {
             if graphicsBehavior == .sendMonitorLayoutDuringGraphicsHandshake {
                 writePacket(MockKRDPFixtures.monitorLayout(), context: context)
             }
-            if graphicsBehavior == .sendCompressedCapsConfirmFirstFrame {
+            if graphicsBehavior == .sendCoalescedCapsAndFrames
+                || graphicsBehavior == .sendCoalescedSegmentedCapsAndFrames
+            {
+                writePacket(
+                    MockKRDPFixtures.graphicsCapsConfirm(capability: selectedCapability,
+                        followingMessages: MockKRDPFixtures.coalescedFrameMessages(),
+                        segmented: graphicsBehavior == .sendCoalescedSegmentedCapsAndFrames),
+                    context: context
+                )
+            } else if graphicsBehavior == .sendCompressedCapsConfirmFirstFrame {
                 writePacket(
                     MockKRDPFixtures.compressedGraphicsCapsConfirmFirst(capability: selectedCapability),
                     context: context
@@ -1503,6 +1515,9 @@ private final class MockKRDPServerHandler: ChannelInboundHandler {
             }
             switch graphicsBehavior {
             case .sendFirstFrame,
+                 .sendCoalescedFrames,
+                 .sendCoalescedCapsAndFrames,
+                 .sendCoalescedSegmentedCapsAndFrames,
                  .sendMonitorLayoutDuringGraphicsHandshake,
                  .sendMonitorLayoutAfterGraphicsReset,
                  .sendPointerUpdatesBeforeFirstFrame,
@@ -1536,6 +1551,15 @@ private final class MockKRDPServerHandler: ChannelInboundHandler {
             _ = try MockKRDPFixtures.staticVirtualChannelPayload(from: packet)
             if graphicsBehavior == .closeAfterFirstFrame {
                 context.close(promise: nil)
+            } else if graphicsBehavior == .sendCoalescedFrames
+                || graphicsBehavior == .sendCoalescedCapsAndFrames
+                || graphicsBehavior == .sendCoalescedSegmentedCapsAndFrames
+            {
+                // Bound live tests even when a broken client only acknowledges the first frame.
+                let channel = context.channel
+                context.eventLoop.scheduleTask(in: .milliseconds(100)) {
+                    channel.close(promise: nil)
+                }
             }
             stage = .done
 
@@ -2332,15 +2356,17 @@ private enum MockKRDPFixtures {
         return shareDataPacket(pduType2: 0x37, payload: payload, pduSource: 0)
     }
 
-    static func resetGraphicsMessage() -> Data {
+    static func resetGraphicsMessage(monitors: [RDPMonitorDefinition] = [
+        RDPMonitorDefinition(left: 0, top: 0, right: 1279, bottom: 719, flags: 1),
+    ]) -> Data {
         var payload = Data()
         payload.appendLittleEndianUInt32(1280)
         payload.appendLittleEndianUInt32(720)
-        payload.appendLittleEndianUInt32(1)
-        appendMonitor(
-            RDPMonitorDefinition(left: 0, top: 0, right: 1279, bottom: 719, flags: 1), to: &payload
-        )
-        payload.append(Data(repeating: 0, count: 300))
+        payload.appendLittleEndianUInt32(UInt32(monitors.count))
+        for monitor in monitors {
+            appendMonitor(monitor, to: &payload)
+        }
+        payload.append(Data(repeating: 0, count: 320 - monitors.count * 20))
         return graphicsMessage(commandID: RDPGFXCommandID.resetGraphics, payload: payload)
     }
 
@@ -2515,11 +2541,14 @@ private enum MockKRDPFixtures {
 
     static func graphicsCapsConfirm(
         capability: RDPGFXCapabilitySet = MockKRDPGraphicsCapabilitySelection.fixedVersion81
-            .selectedCapability(from: nil)
+            .selectedCapability(from: nil),
+        followingMessages: Data = Data(),
+        segmented: Bool = false
     ) -> Data {
         let capability = capability.encoded
         let confirm = graphicsMessage(commandID: RDPGFXCommandID.capsConfirm, payload: capability)
-        return graphicsDynamicPacket(confirm)
+        let messages = confirm + followingMessages
+        return graphicsDynamicPacket(segmented ? zgfxMultipart(messages) : messages)
     }
 
     static func compressedGraphicsCapsConfirmFirst(
@@ -2658,6 +2687,10 @@ private enum MockKRDPFixtures {
              .sendFragmentedCompressedCapsConfirmFirstFrame,
              .closeAfterFirstFrame:
             [graphicsDynamicPacket(avc420FrameMessages())]
+        case .sendCoalescedFrames:
+            [graphicsDynamicPacket(coalescedFrameMessages())]
+        case .sendCoalescedCapsAndFrames, .sendCoalescedSegmentedCapsAndFrames:
+            []
         case .sendMonitorLayoutAfterGraphicsReset:
             [
                 graphicsDynamicPacket(resetGraphicsMessage()),
@@ -2709,6 +2742,16 @@ private enum MockKRDPFixtures {
         case .stallAfterCapsConfirm, .stallAfterFragmentedCapsConfirm:
             []
         }
+    }
+
+    static func coalescedFrameMessages() -> Data {
+        resetGraphicsMessage() + avc420FrameMessages()
+            + resetGraphicsMessage(monitors: [
+                RDPMonitorDefinition(left: -640, top: 0, right: -1, bottom: 719, flags: 0),
+                RDPMonitorDefinition(left: 0, top: 0, right: 639, bottom: 719, flags: 1),
+            ])
+            + startFrameMessage(frameID: 2) + wireToSurfaceMessage() + endFrameMessage(frameID: 2)
+            + startFrameMessage(frameID: 3) + wireToSurfaceMessage() + endFrameMessage(frameID: 3)
     }
 
     static func avc420FrameMessages() -> Data {
